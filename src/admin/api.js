@@ -1,0 +1,575 @@
+import store from '../admin/store.js'
+import { authMiddleware, adminMiddleware } from '../middleware/auth.js'
+import { validateCookie } from './cookie-validator.js'
+import cookieMonitor from './cookie-monitor.js'
+import { banIP, unbanIP, resetIPRecord, getAbuseStats } from '../middleware/abuse-detector.js'
+import apiLogger from '../service/api-logger.js'
+
+const formatCookieForDisplay = (cookie) => {
+    const { id, platform, note, createdAt, updatedAt, createdBy, isActive, isValid, validatedAt, userInfo, validationError } = cookie
+    let cookiePreview = cookie.cookie
+    if (cookiePreview.length > 50) {
+        cookiePreview = cookiePreview.substring(0, 50) + '...'
+    }
+    return { id, platform, cookiePreview, note, createdAt, updatedAt, createdBy, isActive, isValid, validatedAt, userInfo, validationError }
+}
+
+export const adminRoutes = (app) => {
+    app.post('/admin/login', async (c) => {
+        const body = await c.req.json()
+        const { username, password, code } = body
+        
+        if (!username || !password) {
+            return c.json({ success: false, error: '用户名和密码不能为空' }, 400)
+        }
+        
+        const result = await store.authenticateUser(username, password)
+        
+        if (result.success && result.require2FA) {
+            if (!code) {
+                return c.json({ 
+                    success: true, 
+                    require2FA: true, 
+                    data: { username: result.data.username, role: result.data.role }
+                })
+            }
+            const twoFAResult = await store.verify2FALogin(username, code)
+        if (twoFAResult.success) {
+            return c.json(twoFAResult)
+        } else {
+            return c.json(twoFAResult, 400)
+        }
+        }
+        
+        if (result.success) {
+            return c.json(result)
+        } else {
+            return c.json(result, 401)
+        }
+    })
+
+    app.post('/admin/logout', async (c) => {
+        const username = c.req.header('X-Auth-Username')
+        if (username) {
+            await store.logoutUser(username)
+        }
+        return c.json({ success: true })
+    })
+
+    app.get('/admin/check', authMiddleware, async (c) => {
+        const username = c.get('username')
+        const user = store.users.get(username)
+        return c.json({ 
+            success: true, 
+            data: { 
+                username: user.username, 
+                role: user.role 
+            } 
+        })
+    })
+
+    app.get('/admin/cookies', authMiddleware, async (c) => {
+        const platform = c.req.query('platform')
+        const cookies = store.getCookies(platform).map(formatCookieForDisplay)
+        return c.json({ success: true, data: cookies })
+    })
+
+    app.get('/admin/cookies/:id', authMiddleware, async (c) => {
+        const id = c.req.param('id')
+        const cookie = store.getCookie(id)
+        
+        if (!cookie) {
+            return c.json({ success: false, error: 'Cookie不存在' }, 404)
+        }
+        
+        return c.json({ success: true, data: formatCookieForDisplay(cookie) })
+    })
+
+    app.post('/admin/cookies', authMiddleware, async (c) => {
+        const body = await c.req.json()
+        const { platform, cookie, note, skipValidation } = body
+        const username = c.get('username')
+        
+        const result = await store.addCookie(platform, cookie, note, username, skipValidation)
+        
+        if (result.success) {
+            return c.json(result)
+        } else {
+            return c.json(result, 400)
+        }
+    })
+
+    app.put('/admin/cookies/:id', authMiddleware, async (c) => {
+        const id = c.req.param('id')
+        const body = await c.req.json()
+        const username = c.get('username')
+        const { skipValidation, ...updates } = body
+        
+        const result = await store.updateCookie(id, updates, username, skipValidation)
+        
+        if (result.success) {
+            return c.json(result)
+        } else {
+            return c.json(result, 400)
+        }
+    })
+
+    app.delete('/admin/cookies/:id', authMiddleware, async (c) => {
+        const id = c.req.param('id')
+        const username = c.get('username')
+        
+        const result = await store.deleteCookie(id, username)
+        
+        if (result.success) {
+            return c.json(result)
+        } else {
+            return c.json(result, 404)
+        }
+    })
+
+    app.post('/admin/cookies/:id/verify', authMiddleware, async (c) => {
+        const id = c.req.param('id')
+        const username = c.get('username')
+        
+        const result = await store.verifyCookie(id, username)
+        
+        if (result.success) {
+            return c.json(result)
+        } else {
+            return c.json(result, 404)
+        }
+    })
+
+    app.post('/admin/cookies/validate', authMiddleware, async (c) => {
+        const body = await c.req.json()
+        const { platform, cookie } = body
+        
+        if (!platform || !cookie) {
+            return c.json({ success: false, error: '平台和Cookie数据不能为空' }, 400)
+        }
+        
+        const result = await validateCookie(platform, cookie)
+        return c.json({ success: true, data: result })
+    })
+
+    app.get('/admin/users', authMiddleware, adminMiddleware, async (c) => {
+        const users = store.getUsers()
+        return c.json({ success: true, data: users })
+    })
+
+    app.post('/admin/users', authMiddleware, adminMiddleware, async (c) => {
+        const body = await c.req.json()
+        const { username: newUsername, password, role } = body
+        const operator = c.get('username')
+        
+        if (!newUsername || !password) {
+            return c.json({ success: false, error: '用户名和密码不能为空' }, 400)
+        }
+        
+        const result = await store.addUser({ username: newUsername, password, role }, operator)
+        
+        if (result.success) {
+            return c.json(result)
+        } else {
+            return c.json(result, 400)
+        }
+    })
+
+    app.put('/admin/users/:username', authMiddleware, adminMiddleware, async (c) => {
+        const targetUsername = c.req.param('username')
+        const body = await c.req.json()
+        const operator = c.get('username')
+        
+        const result = await store.updateUser(targetUsername, body, operator)
+        
+        if (result.success) {
+            return c.json(result)
+        } else {
+            return c.json(result, 400)
+        }
+    })
+
+    app.put('/admin/profile', authMiddleware, async (c) => {
+        const currentUsername = c.get('username')
+        const body = await c.req.json()
+
+        if (body.role !== undefined || body.password !== undefined) {
+            return c.json({ success: false, error: '禁止通过此接口修改角色或密码' }, 400)
+        }
+
+        const { newUsername } = body
+        if (!newUsername || newUsername === currentUsername) {
+            return c.json({ success: false, error: '新用户名无效' }, 400)
+        }
+
+        const result = await store.updateUser(currentUsername, { newUsername }, currentUsername)
+
+        if (result.success) {
+            return c.json(result)
+        } else {
+            return c.json(result, 400)
+        }
+    })
+
+    app.delete('/admin/users/:username', authMiddleware, adminMiddleware, async (c) => {
+        const targetUsername = c.req.param('username')
+        const operator = c.get('username')
+        
+        const result = await store.deleteUser(targetUsername, operator)
+        
+        if (result.success) {
+            return c.json(result)
+        } else {
+            return c.json(result, 400)
+        }
+    })
+
+    app.get('/admin/logs', authMiddleware, async (c) => {
+        const limit = parseInt(c.req.query('limit') || '100')
+        const offset = parseInt(c.req.query('offset') || '0')
+        const logs = store.getLogs(limit, offset)
+        return c.json({ success: true, data: logs })
+    })
+
+    app.put('/admin/password', authMiddleware, async (c) => {
+        const body = await c.req.json()
+        const { oldPassword, newPassword } = body
+        const username = c.get('username')
+        
+        if (!oldPassword || !newPassword) {
+            return c.json({ success: false, error: '旧密码和新密码不能为空' }, 400)
+        }
+        
+        const user = store.users.get(username)
+        if (!store.verifyPassword(oldPassword, user.password)) {
+            return c.json({ success: false, error: '旧密码错误' }, 400)
+        }
+        
+        const result = await store.updateUser(username, { password: newPassword }, username)
+        if (result.success) {
+            store.migratePasswordHash(username, newPassword)
+        }
+        return c.json(result)
+    })
+
+    app.get('/admin/config', authMiddleware, adminMiddleware, async (c) => {
+        const config = store.getConfig()
+        return c.json({ success: true, data: config })
+    })
+
+    app.put('/admin/config/admin-path', authMiddleware, adminMiddleware, async (c) => {
+        const body = await c.req.json()
+        const { adminPath } = body
+        const operator = c.get('username')
+        
+        const result = await store.setAdminPath(adminPath, operator)
+        
+        if (result.success) {
+            return c.json(result)
+        } else {
+            return c.json(result, 400)
+        }
+    })
+
+    app.get('/admin/webhook', authMiddleware, adminMiddleware, async (c) => {
+        const config = store.getWebhookConfig()
+        return c.json({ success: true, data: config })
+    })
+
+    app.put('/admin/webhook', authMiddleware, adminMiddleware, async (c) => {
+        const body = await c.req.json()
+        const operator = c.get('username')
+        
+        const result = await store.setWebhookConfig(body, operator)
+        
+        if (result.success) {
+            return c.json(result)
+        } else {
+            return c.json(result, 400)
+        }
+    })
+
+    app.post('/admin/webhook/test', authMiddleware, adminMiddleware, async (c) => {
+        const result = await cookieMonitor.testWebhook()
+        
+        if (result.sent) {
+            return c.json({ success: true, message: 'Webhook测试消息已发送' })
+        } else {
+            return c.json({ success: false, error: result.error || '发送失败' }, 400)
+        }
+    })
+
+    app.get('/admin/monitor', authMiddleware, adminMiddleware, async (c) => {
+        const config = store.getMonitorConfig()
+        return c.json({ success: true, data: config })
+    })
+
+    app.put('/admin/monitor', authMiddleware, adminMiddleware, async (c) => {
+        const body = await c.req.json()
+        const operator = c.get('username')
+        
+        const result = await store.setMonitorConfig(body, operator)
+        
+        if (result.success) {
+            if (body.enabled !== undefined || body.interval !== undefined) {
+                cookieMonitor.restart()
+            }
+            return c.json(result)
+        } else {
+            return c.json(result, 400)
+        }
+    })
+
+    app.get('/admin/monitor/status', authMiddleware, adminMiddleware, async (c) => {
+        const status = cookieMonitor.getStatus()
+        return c.json({ success: true, data: status })
+    })
+
+    app.post('/admin/monitor/check', authMiddleware, adminMiddleware, async (c) => {
+        const result = await cookieMonitor.checkNow()
+        
+        if (result.success) {
+            return c.json({ success: true, message: '检查已完成' })
+        } else {
+            return c.json(result, 400)
+        }
+    })
+
+    app.get('/admin/monitor/logs', authMiddleware, adminMiddleware, async (c) => {
+        const limit = parseInt(c.req.query('limit') || '100')
+        const offset = parseInt(c.req.query('offset') || '0')
+        const logs = store.getMonitorLogs(limit, offset)
+        return c.json({ success: true, data: logs })
+    })
+
+    app.get('/admin/2fa/status', authMiddleware, async (c) => {
+        const username = c.get('username')
+        const status = store.get2FAStatus(username)
+        return c.json({ success: true, data: status })
+    })
+
+    app.post('/admin/2fa/setup', authMiddleware, async (c) => {
+        const username = c.get('username')
+        const result = store.setup2FA(username)
+        if (result.success) {
+            try {
+                const QRCode = (await import('qrcode')).default
+                const qrDataUrl = await QRCode.toDataURL(result.data.otpAuthUrl, { width: 200, margin: 1 })
+                result.data.qrDataUrl = qrDataUrl
+            } catch (e) {
+                return c.json({ success: false, error: 'QR码生成失败: ' + e.message }, 500)
+            }
+            return c.json(result)
+        } else {
+            return c.json(result, 400)
+        }
+    })
+
+    app.post('/admin/2fa/enable', authMiddleware, async (c) => {
+        const body = await c.req.json()
+        const { code } = body
+        const username = c.get('username')
+
+        if (!code) {
+            return c.json({ success: false, error: '验证码不能为空' }, 400)
+        }
+
+        const result = await store.enable2FA(username, code)
+        if (result.success) {
+            return c.json(result)
+        } else {
+            return c.json(result, 400)
+        }
+    })
+
+    app.post('/admin/2fa/disable', authMiddleware, async (c) => {
+        const body = await c.req.json()
+        const { password } = body
+        const username = c.get('username')
+
+        if (!password) {
+            return c.json({ success: false, error: '密码不能为空' }, 400)
+        }
+
+        const result = await store.disable2FA(username, password)
+        if (result.success) {
+            return c.json(result)
+        } else {
+            return c.json(result, 400)
+        }
+    })
+
+    app.get('/admin/tokens', authMiddleware, adminMiddleware, async (c) => {
+        const tokens = store.getApiTokens()
+        return c.json({ success: true, data: tokens })
+    })
+
+    app.post('/admin/tokens', authMiddleware, adminMiddleware, async (c) => {
+        const body = await c.req.json()
+        const { name, permissions } = body
+        const operator = c.get('username')
+
+        if (!name) {
+            return c.json({ success: false, error: 'Token名称不能为空' }, 400)
+        }
+
+        const result = await store.createApiToken(name, permissions || [], operator)
+        return c.json(result)
+    })
+
+    app.get('/admin/tokens/:id', authMiddleware, adminMiddleware, async (c) => {
+        const id = c.req.param('id')
+        const token = store.getApiToken(id)
+        if (!token) {
+            return c.json({ success: false, error: 'Token不存在' }, 404)
+        }
+        const { token: _, ...safeToken } = token
+        return c.json({ success: true, data: safeToken })
+    })
+
+    app.put('/admin/tokens/:id', authMiddleware, adminMiddleware, async (c) => {
+        const id = c.req.param('id')
+        const body = await c.req.json()
+        const operator = c.get('username')
+
+        const result = await store.updateApiToken(id, body, operator)
+        if (result.success) {
+            const { token: _, ...safeToken } = result.data
+            return c.json({ success: true, data: safeToken })
+        } else {
+            return c.json(result, 400)
+        }
+    })
+
+    app.delete('/admin/tokens/:id', authMiddleware, adminMiddleware, async (c) => {
+        const id = c.req.param('id')
+        const operator = c.get('username')
+
+        const result = await store.deleteApiToken(id, operator)
+        if (result.success) {
+            return c.json(result)
+        } else {
+            return c.json(result, 404)
+        }
+    })
+
+    // ============ 滥用检测与防护 ============
+
+    app.get('/admin/abuse/stats', authMiddleware, adminMiddleware, async (c) => {
+        const runtimeStats = getAbuseStats()
+        const persistStats = store.getAbuseStats()
+        return c.json({
+            success: true,
+            data: { ...runtimeStats, ...persistStats },
+        })
+    })
+
+    app.get('/admin/abuse/logs', authMiddleware, adminMiddleware, async (c) => {
+        const limit = parseInt(c.req.query('limit') || '100')
+        const offset = parseInt(c.req.query('offset') || '0')
+        const ip = c.req.query('ip')
+        const level = c.req.query('level')
+        const blocked = c.req.query('blocked')
+
+        const filters = {}
+        if (ip) filters.ip = ip
+        if (level) filters.level = level
+        if (blocked !== undefined) filters.blocked = blocked === 'true'
+
+        const logs = store.getAbuseLogs(limit, offset, filters)
+        return c.json({ success: true, data: logs })
+    })
+
+    app.delete('/admin/abuse/logs', authMiddleware, adminMiddleware, async (c) => {
+        const operator = c.get('username')
+        await store.clearAbuseLogs(operator)
+        return c.json({ success: true })
+    })
+
+    app.get('/admin/abuse/config', authMiddleware, adminMiddleware, async (c) => {
+        return c.json({ success: true, data: store.getAbuseConfig() })
+    })
+
+    app.put('/admin/abuse/config', authMiddleware, adminMiddleware, async (c) => {
+        const operator = c.get('username')
+        const body = await c.req.json()
+        const result = await store.setAbuseConfig(body, operator)
+        return c.json(result, result.success ? 200 : 400)
+    })
+
+    app.get('/admin/abuse/bans', authMiddleware, adminMiddleware, async (c) => {
+        return c.json({ success: true, data: store.getIpBans() })
+    })
+
+    app.post('/admin/abuse/bans', authMiddleware, adminMiddleware, async (c) => {
+        const { ip, reason, duration, permanent } = await c.req.json()
+        if (!ip) return c.json({ success: false, error: 'IP不能为空' }, 400)
+
+        banIP(ip, reason, duration, !!permanent)
+        await store.addLog('ip_ban', `手动${permanent ? '永久' : ''}封禁IP: ${ip}`, c.get('username'))
+        return c.json({ success: true })
+    })
+
+    app.delete('/admin/abuse/bans/:ip', authMiddleware, adminMiddleware, async (c) => {
+        const ip = c.req.param('ip')
+        const operator = c.get('username')
+        unbanIP(ip)
+        await store.removeIpBan(ip, operator)
+        return c.json({ success: true })
+    })
+
+    app.post('/admin/abuse/reset/:ip', authMiddleware, adminMiddleware, async (c) => {
+        const ip = c.req.param('ip')
+        resetIPRecord(ip)
+        return c.json({ success: true })
+    })
+
+    // === API 调用日志 ===
+
+    app.get('/admin/api-logs/stats', authMiddleware, async (c) => {
+        return c.json({ success: true, data: apiLogger.getStats() })
+    })
+
+    app.get('/admin/api-logs', authMiddleware, async (c) => {
+        const { startTime, endTime, ip, server, type, status, keyword, page, pageSize } = c.req.query()
+        const result = apiLogger.getLogs({
+            startTime: startTime ? Number(startTime) : undefined,
+            endTime: endTime ? Number(endTime) : undefined,
+            ip: ip || undefined,
+            server: server || undefined,
+            type: type || undefined,
+            status: status || undefined,
+            keyword: keyword || undefined,
+            page: page ? Math.max(1, parseInt(page) || 1) : 1,
+            pageSize: pageSize ? Math.min(200, Math.max(10, parseInt(pageSize) || 50)) : 50,
+        })
+        return c.json({ success: true, ...result })
+    })
+
+    app.delete('/admin/api-logs', authMiddleware, adminMiddleware, async (c) => {
+        apiLogger.clearLogs()
+        await store.addLog('api_logs_clear', '清空API调用日志', c.get('username'))
+        return c.json({ success: true })
+    })
+
+    app.get('/admin/api-logs/export', authMiddleware, async (c) => {
+        const { startTime, endTime, ip, server, type, status, keyword } = c.req.query()
+        const csv = apiLogger.exportCSV({
+            startTime: startTime ? Number(startTime) : undefined,
+            endTime: endTime ? Number(endTime) : undefined,
+            ip: ip || undefined,
+            server: server || undefined,
+            type: type || undefined,
+            status: status || undefined,
+            keyword: keyword || undefined,
+        })
+        return new Response(csv, {
+            headers: {
+                'Content-Type': 'text/csv; charset=utf-8',
+                'Content-Disposition': `attachment; filename="api-logs-${new Date().toISOString().slice(0, 10)}.csv"`,
+            }
+        })
+    })
+}
+
+export default adminRoutes
