@@ -472,8 +472,8 @@ app.get('/', (c) => {
             <div class="badges">
                 <a href="https://github.com/ybming/Meting-API" style="text-decoration:none;">
                     <img alt="Github" src="https://img.shields.io/badge/Github-Meting-green">
-                    <img alt="Forks" src="https://img.shields.io/github/forks/mikus-loli/Meting-API">
-                    <img alt="Stars" src="https://img.shields.io/github/stars/mikus-loli/Meting-API">
+                    <img alt="Forks" src="https://img.shields.io/github/forks/ybming/Meting-API">
+                    <img alt="Stars" src="https://img.shields.io/github/stars/ybming/Meting-API">
                 </a>
             </div>
         </div>
